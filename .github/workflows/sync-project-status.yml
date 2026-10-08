@@ -15,12 +15,13 @@ env:
   PROJECT_NUMBER: "2" # the N in github.com/orgs/onlineoms/projects/N
   STATUS_FIELD: Status
   TODO_OPTION: Todo
+  INPROGRESS_OPTION: In Progress
   DONE_OPTION: Done
   DAYS: ${{ github.event.inputs.days || '7' }}
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Sync status
         env:
@@ -46,21 +47,39 @@ jobs:
 
           PROJECT_ID=$(jq -r '.data.organization.projectV2.id' <<<"$META")
           FIELD_ID=$(jq -r '.data.organization.projectV2.field.id' <<<"$META")
-          TODO_ID=$(jq -r --arg t "$TODO_OPTION" '.data.organization.projectV2.field.options[] | select(.name==$t) | .id' <<<"$META")
-          DONE_ID=$(jq -r --arg t "$DONE_OPTION" '.data.organization.projectV2.field.options[] | select(.name==$t) | .id' <<<"$META")
+          opt() { jq -r --arg t "$1" '.data.organization.projectV2.field.options[] | select(.name==$t) | .id' <<<"$META"; }
+          TODO_ID=$(opt "$TODO_OPTION")
+          PROG_ID=$(opt "$INPROGRESS_OPTION")
+          DONE_ID=$(opt "$DONE_OPTION")
 
-          if [ -z "$PROJECT_ID" ] || [ -z "$FIELD_ID" ] || [ -z "$TODO_ID" ] || [ -z "$DONE_ID" ]; then
+          if [ -z "$PROJECT_ID" ] || [ -z "$FIELD_ID" ] || [ -z "$TODO_ID" ] || [ -z "$PROG_ID" ] || [ -z "$DONE_ID" ]; then
             echo "Could not resolve project, field or options" >&2
             exit 1
           fi
 
-          # 2. Search issues (assigned to me, or created by me) updated recently
+          # 2. Search issues AND pull requests (assigned to me, or created by me)
           search() {
             gh api graphql -f q="$1" -f query='
               query($q: String!) {
                 search(query: $q, type: ISSUE, first: 100) {
                   nodes {
+                    __typename
                     ... on Issue {
+                      id
+                      number
+                      state
+                      repository { nameWithOwner }
+                      projectItems(first: 20) {
+                        nodes {
+                          id
+                          project { id }
+                          fieldValueByName(name: "Status") {
+                            ... on ProjectV2ItemFieldSingleSelectValue { name }
+                          }
+                        }
+                      }
+                    }
+                    ... on PullRequest {
                       id
                       number
                       state
@@ -81,17 +100,18 @@ jobs:
           }
 
           {
-            search "org:$ORG is:issue assignee:$ME updated:>=$SINCE"
-            search "org:$ORG is:issue author:$ME updated:>=$SINCE"
-          } | jq -sc 'unique_by(.id) | .[]' > issues.jsonl
+            search "org:$ORG assignee:$ME updated:>=$SINCE"
+            search "org:$ORG author:$ME updated:>=$SINCE"
+          } | jq -sc 'unique_by(.id) | .[]' > items.jsonl
 
           # 3. Decide and update
-          while read -r ISSUE; do
-            ID=$(jq -r '.id' <<<"$ISSUE")
-            STATE=$(jq -r '.state' <<<"$ISSUE")
-            LABEL=$(jq -r '.repository.nameWithOwner + "#" + (.number|tostring)' <<<"$ISSUE")
+          while read -r ROW; do
+            ID=$(jq -r '.id' <<<"$ROW")
+            TYPE=$(jq -r '.__typename' <<<"$ROW")
+            STATE=$(jq -r '.state' <<<"$ROW")
+            LABEL=$(jq -r '.repository.nameWithOwner + "#" + (.number|tostring)' <<<"$ROW")
 
-            ITEM=$(jq -c --arg p "$PROJECT_ID" '[.projectItems.nodes[] | select(.project.id==$p)][0] // empty' <<<"$ISSUE")
+            ITEM=$(jq -c --arg p "$PROJECT_ID" '[.projectItems.nodes[] | select(.project.id==$p)][0] // empty' <<<"$ROW")
             ITEM_ID=""
             STATUS=""
             if [ -n "$ITEM" ]; then
@@ -100,10 +120,18 @@ jobs:
             fi
 
             TARGET=""
-            if [ "$STATE" = "CLOSED" ]; then
+            if [ "$TYPE" = "PullRequest" ] && [ "$STATE" = "CLOSED" ]; then
+              # Closed without merging -> leave alone
+              :
+            elif [ "$STATE" != "OPEN" ]; then
+              # Closed issue or merged PR -> Done
               if [ "$STATUS" != "$DONE_OPTION" ]; then TARGET="$DONE_ID"; fi
-            elif [ -z "$STATUS" ]; then
-              TARGET="$TODO_ID"
+            elif [ "$TYPE" = "PullRequest" ]; then
+              # Open PR -> In Progress (only from empty or Todo)
+              if [ -z "$STATUS" ] || [ "$STATUS" = "$TODO_OPTION" ]; then TARGET="$PROG_ID"; fi
+            else
+              # Open issue with no status -> Todo
+              if [ -z "$STATUS" ]; then TARGET="$TODO_ID"; fi
             fi
 
             if [ -z "$TARGET" ]; then continue; fi
@@ -127,5 +155,5 @@ jobs:
                   }) { projectV2Item { id } }
                 }' > /dev/null
 
-            echo "$LABEL ($STATE): status updated"
-          done < issues.jsonl
+            echo "$LABEL ($TYPE, $STATE): status updated"
+          done < items.jsonl
