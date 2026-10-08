@@ -1,0 +1,36 @@
+name: WhatsApp digest
+
+on:
+  schedule:
+    - cron: "0 0 * * 1-6"  # 8:00 AM MYT, Mon-Sat (morning)
+    - cron: "30 9 * * 1-5" # 5:30 PM MYT, Mon-Fri (evening)
+    - cron: "0 10 * * 6"   # 6:00 PM MYT, Sat (weekly report)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Which message"
+        type: choice
+        options: [morning, evening, weekly]
+        default: morning
+      dry_run:
+        description: "Build the message but do not send"
+        type: boolean
+        default: false
+
+jobs:
+  digest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Send digest
+        run: node scripts/digest.mjs
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          WA_PHONE: ${{ secrets.WA_PHONE }}
+          WA_APIKEY: ${{ secrets.WA_APIKEY }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+          MODE: ${{ inputs.mode || (github.event.schedule == '0 0 * * 1-6' && 'morning') || (github.event.schedule == '30 9 * * 1-5' && 'evening') || 'weekly' }}
