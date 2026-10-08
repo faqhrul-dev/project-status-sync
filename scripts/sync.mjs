@@ -49,8 +49,8 @@ async function setField(item, fieldName, raw) {
         }`,
         { p: P.projectId, i: item.itemId, f: f.id, v: value },
       );
-    } catch {
-      console.log(`${label(item)}: ${fieldName} skipped (GitHub refused)`);
+    } catch (e) {
+      console.log(`${label(item)}: ${fieldName} skipped (${e.message})`);
       return false;
     }
   }
