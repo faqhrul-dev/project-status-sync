@@ -30,5 +30,7 @@ jobs:
         run: node scripts/sync.mjs
         env:
           GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          WA_PHONE: ${{ secrets.WA_PHONE }}
+          WA_APIKEY: ${{ secrets.WA_APIKEY }}
           LOOKBACK_DAYS: ${{ inputs.days || '14' }}
           DRY_RUN: ${{ inputs.dry_run || false }}
