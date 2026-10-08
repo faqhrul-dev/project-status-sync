@@ -1,0 +1,131 @@
+name: Sync Dev Pipeline status
+
+on:
+  schedule:
+    - cron: "*/10 * * * *" # every 10 minutes (UTC)
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Look back this many days (use a bigger number to backfill)"
+        default: "7"
+
+env:
+  ORG: onlineoms
+  ME: faqhrul-dev
+  PROJECT_NUMBER: "2" # the N in github.com/orgs/onlineoms/projects/N
+  STATUS_FIELD: Status
+  TODO_OPTION: Todo
+  DONE_OPTION: Done
+  DAYS: ${{ github.event.inputs.days || '7' }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync status
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+        run: |
+          set -euo pipefail
+          SINCE=$(date -u -d "${DAYS} days ago" +%F)
+
+          # 1. Project id, Status field id, option ids
+          META=$(gh api graphql \
+            -f org="$ORG" -F number="$PROJECT_NUMBER" -f field="$STATUS_FIELD" \
+            -f query='
+              query($org: String!, $number: Int!, $field: String!) {
+                organization(login: $org) {
+                  projectV2(number: $number) {
+                    id
+                    field(name: $field) {
+                      ... on ProjectV2SingleSelectField { id options { id name } }
+                    }
+                  }
+                }
+              }')
+
+          PROJECT_ID=$(jq -r '.data.organization.projectV2.id' <<<"$META")
+          FIELD_ID=$(jq -r '.data.organization.projectV2.field.id' <<<"$META")
+          TODO_ID=$(jq -r --arg t "$TODO_OPTION" '.data.organization.projectV2.field.options[] | select(.name==$t) | .id' <<<"$META")
+          DONE_ID=$(jq -r --arg t "$DONE_OPTION" '.data.organization.projectV2.field.options[] | select(.name==$t) | .id' <<<"$META")
+
+          if [ -z "$PROJECT_ID" ] || [ -z "$FIELD_ID" ] || [ -z "$TODO_ID" ] || [ -z "$DONE_ID" ]; then
+            echo "Could not resolve project, field or options" >&2
+            exit 1
+          fi
+
+          # 2. Search issues (assigned to me, or created by me) updated recently
+          search() {
+            gh api graphql -f q="$1" -f query='
+              query($q: String!) {
+                search(query: $q, type: ISSUE, first: 100) {
+                  nodes {
+                    ... on Issue {
+                      id
+                      number
+                      state
+                      repository { nameWithOwner }
+                      projectItems(first: 20) {
+                        nodes {
+                          id
+                          project { id }
+                          fieldValueByName(name: "Status") {
+                            ... on ProjectV2ItemFieldSingleSelectValue { name }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }' --jq '.data.search.nodes[] | select(.id)'
+          }
+
+          {
+            search "org:$ORG is:issue assignee:$ME updated:>=$SINCE"
+            search "org:$ORG is:issue author:$ME updated:>=$SINCE"
+          } | jq -sc 'unique_by(.id) | .[]' > issues.jsonl
+
+          # 3. Decide and update
+          while read -r ISSUE; do
+            ID=$(jq -r '.id' <<<"$ISSUE")
+            STATE=$(jq -r '.state' <<<"$ISSUE")
+            LABEL=$(jq -r '.repository.nameWithOwner + "#" + (.number|tostring)' <<<"$ISSUE")
+
+            ITEM=$(jq -c --arg p "$PROJECT_ID" '[.projectItems.nodes[] | select(.project.id==$p)][0] // empty' <<<"$ISSUE")
+            ITEM_ID=""
+            STATUS=""
+            if [ -n "$ITEM" ]; then
+              ITEM_ID=$(jq -r '.id' <<<"$ITEM")
+              STATUS=$(jq -r '.fieldValueByName.name // empty' <<<"$ITEM")
+            fi
+
+            TARGET=""
+            if [ "$STATE" = "CLOSED" ]; then
+              if [ "$STATUS" != "$DONE_OPTION" ]; then TARGET="$DONE_ID"; fi
+            elif [ -z "$STATUS" ]; then
+              TARGET="$TODO_ID"
+            fi
+
+            if [ -z "$TARGET" ]; then continue; fi
+
+            if [ -z "$ITEM_ID" ]; then
+              ITEM_ID=$(gh api graphql -f project="$PROJECT_ID" -f content="$ID" -f query='
+                mutation($project: ID!, $content: ID!) {
+                  addProjectV2ItemById(input: {projectId: $project, contentId: $content}) {
+                    item { id }
+                  }
+                }' --jq '.data.addProjectV2ItemById.item.id')
+            fi
+
+            gh api graphql \
+              -f project="$PROJECT_ID" -f item="$ITEM_ID" \
+              -f field="$FIELD_ID" -f option="$TARGET" -f query='
+                mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $project, itemId: $item, fieldId: $field,
+                    value: { singleSelectOptionId: $option }
+                  }) { projectV2Item { id } }
+                }' > /dev/null
+
+            echo "$LABEL ($STATE): status updated"
+          done < issues.jsonl
