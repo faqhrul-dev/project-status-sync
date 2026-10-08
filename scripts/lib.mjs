@@ -43,10 +43,26 @@ export async function gql(query, variables = {}) {
 export function mytDate(offsetDays = 0) {
   return new Date(Date.now() + 8 * 3600e3 + offsetDays * 86400e3).toISOString().slice(0, 10);
 }
-export function nextWorkDay() {
-  let d = 1;
-  while (new Date(`${mytDate(d)}T00:00:00Z`).getUTCDay() === 0) d++; // skip Sunday
-  return mytDate(d);
+export const isWorkday = (iso) => new Date(`${iso}T00:00:00Z`).getUTCDay() !== 0; // Sunday off
+export function addDays(iso, n) {
+  const d = new Date(`${iso}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+export function shiftWorkdays(iso, n) {
+  let d = iso;
+  for (let left = n; left > 0; ) {
+    d = addDays(d, 1);
+    if (isWorkday(d)) left--;
+  }
+  return d;
+}
+export const nextWorkdayAfter = (iso) => shiftWorkdays(iso, 1);
+export const nextWorkDay = () => nextWorkdayAfter(mytDate());
+export function countWorkdays(from, to) {
+  let n = 0;
+  for (let d = from; d <= to; d = addDays(d, 1)) if (isWorkday(d)) n++;
+  return n;
 }
 export function prettyDate(iso) {
   return new Date(`${iso}T00:00:00Z`).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
@@ -71,10 +87,11 @@ const CONTENT = `
   content {
     __typename
     ... on Issue {
-      id number title state closedAt
+      id number title body state closedAt
       repository { name }
       author { login }
       assignees(first: 10) { nodes { login } }
+      parent { id }
       subIssues(first: 50) { nodes { id state } }
       timelineItems(itemTypes: [REOPENED_EVENT], last: 1) { nodes { ... on ReopenedEvent { createdAt } } }
     }
@@ -102,6 +119,8 @@ function normalize(n) {
     number: c.number,
     title: c.title,
     state: c.state,
+    body: c.body || '',
+    parentId: c.parent?.id || null,
     closedAt: c.closedAt || null,
     repo: c.repository?.name,
     author: c.author?.login,
@@ -161,4 +180,55 @@ export async function loadProject() {
     fields,
     items: items.filter((i) => i.type === 'Issue' || i.type === 'PullRequest'),
   };
+}
+
+// ---------- Dates hidden in the issue description ----------
+// e.g. <!-- Start: 2026-10-09 Target: 2026-10-10 -->
+export function bodyDates(body = '') {
+  return {
+    start: body.match(/Start:\s*(\d{4}-\d{2}-\d{2})/i)?.[1] || null,
+    target: body.match(/Target:\s*(\d{4}-\d{2}-\d{2})/i)?.[1] || null,
+  };
+}
+
+// ---------- State, kept in a repo variable (SYNC_STATE) ----------
+const REPO = process.env.GITHUB_REPOSITORY;
+const STATE_VAR = 'SYNC_STATE';
+const restHeaders = {
+  Authorization: `bearer ${TOKEN}`,
+  Accept: 'application/vnd.github+json',
+  'Content-Type': 'application/json',
+};
+export async function loadState() {
+  const res = await fetch(`https://api.github.com/repos/${REPO}/actions/variables/${STATE_VAR}`, { headers: restHeaders });
+  if (res.status === 404) return { exists: false, data: {} };
+  if (!res.ok) throw new Error(`Could not read state: HTTP ${res.status}`);
+  const j = await res.json();
+  return { exists: true, data: JSON.parse(j.value || '{}') };
+}
+export async function saveState(state) {
+  const url = state.exists
+    ? `https://api.github.com/repos/${REPO}/actions/variables/${STATE_VAR}`
+    : `https://api.github.com/repos/${REPO}/actions/variables`;
+  const res = await fetch(url, {
+    method: state.exists ? 'PATCH' : 'POST',
+    headers: restHeaders,
+    body: JSON.stringify({ name: STATE_VAR, value: JSON.stringify(state.data) }),
+  });
+  if (!res.ok) throw new Error(`Could not save state: HTTP ${res.status}`);
+  state.exists = true;
+}
+
+// ---------- WhatsApp (CallMeBot) ----------
+export async function sendWhatsApp(text) {
+  const { WA_PHONE, WA_APIKEY } = process.env;
+  if (!WA_PHONE || !WA_APIKEY) return console.log('WhatsApp not configured, skipped');
+  const url =
+    'https://api.callmebot.com/whatsapp.php' +
+    `?phone=${encodeURIComponent(WA_PHONE)}` +
+    `&text=${encodeURIComponent(text)}` +
+    `&apikey=${encodeURIComponent(WA_APIKEY)}`;
+  const res = await fetch(url);
+  console.log(`WhatsApp sent: HTTP ${res.status}`); // never log the message itself
+  return res.ok;
 }
