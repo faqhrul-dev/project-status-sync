@@ -175,11 +175,28 @@ export async function loadProject() {
     after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
   } while (after);
 
-  return {
-    projectId: project.id,
-    fields,
-    items: items.filter((i) => i.type === 'Issue' || i.type === 'PullRequest'),
-  };
+  const kept = items.filter((i) => i.type === 'Issue' || i.type === 'PullRequest');
+
+  // Read org issue fields (Start date, Target date...) straight from my recent issues
+  const issueFields = await loadIssueFields();
+  if (Object.keys(issueFields).length) {
+    const monthAgo = new Date(Date.now() - 30 * 86400e3).toISOString();
+    const targets = kept.filter(
+      (i) => i.type === 'Issue' && isMine(i) && (i.state === 'OPEN' || (i.closedAt || '') >= monthAgo),
+    );
+    let failed = 0;
+    await pool(targets, 6, async (it) => {
+      try {
+        await readIssueFieldValues(it, issueFields);
+      } catch {
+        it.issueFieldsUnknown = true; // never write issue fields we could not read
+        failed++;
+      }
+    });
+    if (failed) console.log(`Could not read issue fields on ${failed} issue(s); they will not be changed`);
+  }
+
+  return { projectId: project.id, fields, items: kept };
 }
 
 // ---------- Dates hidden in the issue description ----------
@@ -234,15 +251,18 @@ export async function sendWhatsApp(text) {
 }
 
 // ---------- Org "issue fields" (e.g. Start date, Target date) ----------
-// These live on the issue itself, not the board, so they need the REST API.
+// These live on the issue itself, not the board, so they are read and written with the REST API.
+let issueFieldsCache;
 export async function loadIssueFields() {
+  if (issueFieldsCache) return issueFieldsCache;
   const res = await fetch(`https://api.github.com/orgs/${ORG}/issue-fields`, { headers: restHeaders });
   if (!res.ok) {
     console.log(`Issue fields not available (HTTP ${res.status})`);
-    return {};
+    return (issueFieldsCache = {});
   }
   const list = await res.json();
-  return Object.fromEntries(list.map((f) => [f.name.toLowerCase(), { id: f.id, name: f.name }]));
+  issueFieldsCache = Object.fromEntries(list.map((f) => [f.name.toLowerCase(), { id: f.id, name: f.name }]));
+  return issueFieldsCache;
 }
 export async function setIssueFieldValue(repo, number, fieldId, value) {
   const res = await fetch(`https://api.github.com/repos/${ORG}/${repo}/issues/${number}/issue-field-values`, {
@@ -251,4 +271,46 @@ export async function setIssueFieldValue(repo, number, fieldId, value) {
     body: JSON.stringify({ issue_field_values: [{ field_id: fieldId, value: String(value) }] }),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+}
+
+// Our names for fields (from F), so "Start Date" on GitHub still maps to F.start
+const canonical = (name) => Object.values(F).find((n) => n.toLowerCase() === name.toLowerCase()) || name;
+
+let warnedShape = false;
+function parseIssueFieldValue(o, byId) {
+  const id = o.issue_field_id ?? o.field_id ?? o.issue_field?.id ?? o.field?.id;
+  const name = byId[id]?.name ?? o.issue_field?.name ?? o.field?.name ?? o.name;
+  let v = o.value;
+  if (v && typeof v === 'object') v = v.name ?? v.value ?? null;
+  v ??= o.single_select_option?.name ?? o.date_value ?? o.text_value ?? o.number_value ?? null;
+  if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(v)) v = v.slice(0, 10);
+  if (!name && !warnedShape) {
+    warnedShape = true;
+    console.log(`Unrecognised issue field value shape, keys: ${Object.keys(o).join(', ')}`);
+  }
+  return name ? { name: canonical(name), value: v, updatedAt: o.updated_at || o.updatedAt || '' } : null;
+}
+
+async function readIssueFieldValues(item, fields) {
+  const byId = Object.fromEntries(Object.values(fields).map((f) => [f.id, f]));
+  const res = await fetch(
+    `https://api.github.com/repos/${ORG}/${item.repo}/issues/${item.number}/issue-field-values?per_page=100`,
+    { headers: restHeaders },
+  );
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const j = await res.json();
+  const list = Array.isArray(j) ? j : j.issue_field_values || [];
+  // Issue fields are the source of truth: clear whatever the board said, then fill from the issue
+  for (const f of Object.values(fields)) delete item.values[canonical(f.name)];
+  for (const o of list) {
+    const p = parseIssueFieldValue(o, byId);
+    if (p && p.value != null) item.values[p.name] = { value: p.value, updatedAt: p.updatedAt };
+  }
+}
+
+async function pool(list, size, fn) {
+  let i = 0;
+  await Promise.all(Array.from({ length: size }, async () => {
+    while (i < list.length) await fn(list[i++]);
+  }));
 }
