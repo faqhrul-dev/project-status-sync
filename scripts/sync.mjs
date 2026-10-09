@@ -34,6 +34,7 @@ async function setField(item, fieldName, raw) {
   if (raw == null || val(item, fieldName) === raw) return false;
   const issueField = ISSUE_FIELDS[fieldName.toLowerCase()];
   if (issueField && item.type !== 'Issue') return false; // issue fields don't exist on PRs
+  if (issueField && (item.issueFieldsUnknown || !isMine(item))) return false; // only write what we could read
 
   let f;
   let value;
@@ -334,8 +335,9 @@ for (const parent of myIssues) {
   await syncDate(parent, children, F.start, 'min');
 }
 
-// ---------- 13. Start date when work begins ----------
+// ---------- 13. Start date when work begins (parents follow their sub-issues instead) ----------
 for (const it of myIssues) {
+  if (it.subIssues.length) continue;
   if (val(it, F.status) === S.prog && !val(it, F.start)) await setField(it, F.start, TODAY);
 }
 
