@@ -2,6 +2,7 @@ import {
   ORG, ME, F, S, DEFAULT_MODULE, STAGES,
   gql, mytDate, prettyDate, isWorkday, addDays, shiftWorkdays, nextWorkdayAfter, countWorkdays,
   val, isMine, label, loadProject, bodyDates, loadState, saveState, sendWhatsApp,
+  loadIssueFields, setIssueFieldValue,
 } from './lib.mjs';
 
 const DAYS = Number(process.env.LOOKBACK_DAYS || 14);
@@ -27,35 +28,46 @@ st8.overdueRun ??= '';
 st8.overnight ??= { date: '', moves: [] };
 
 // ---------- Write helpers ----------
-async function setField(item, fieldName, raw) {
-  const f = P.fields[fieldName];
-  if (!f) return console.log(`Field "${fieldName}" not found on board`), false;
-  if (raw == null || val(item, fieldName) === raw) return false;
+const ISSUE_FIELDS = await loadIssueFields(); // org-level fields such as Start date / Target date
 
+async function setField(item, fieldName, raw) {
+  if (raw == null || val(item, fieldName) === raw) return false;
+  const issueField = ISSUE_FIELDS[fieldName.toLowerCase()];
+  if (issueField && item.type !== 'Issue') return false; // issue fields don't exist on PRs
+
+  let f;
   let value;
-  if (f.dataType === 'SINGLE_SELECT') {
-    const opt = f.options.find((o) => o.name === raw);
-    if (!opt) return console.log(`Option "${raw}" not found in "${fieldName}"`), false;
-    value = { singleSelectOptionId: opt.id };
-  } else if (f.dataType === 'DATE') value = { date: raw };
-  else if (f.dataType === 'NUMBER') value = { number: Number(raw) };
-  else value = { text: String(raw) };
+  if (!issueField) {
+    f = P.fields[fieldName];
+    if (!f) return console.log(`Field "${fieldName}" not found on board`), false;
+    if (f.dataType === 'SINGLE_SELECT') {
+      const opt = f.options.find((o) => o.name === raw);
+      if (!opt) return console.log(`Option "${raw}" not found in "${fieldName}"`), false;
+      value = { singleSelectOptionId: opt.id };
+    } else if (f.dataType === 'DATE') value = { date: raw };
+    else if (f.dataType === 'NUMBER') value = { number: Number(raw) };
+    else value = { text: String(raw) };
+  }
 
   if (!DRY) {
     try {
-      await gql(
-        `mutation($p: ID!, $i: ID!, $f: ID!, $v: ProjectV2FieldValue!) {
-          updateProjectV2ItemFieldValue(input: { projectId: $p, itemId: $i, fieldId: $f, value: $v }) { projectV2Item { id } }
-        }`,
-        { p: P.projectId, i: item.itemId, f: f.id, v: value },
-      );
+      if (issueField) {
+        await setIssueFieldValue(item.repo, item.number, issueField.id, raw);
+      } else {
+        await gql(
+          `mutation($p: ID!, $i: ID!, $f: ID!, $v: ProjectV2FieldValue!) {
+            updateProjectV2ItemFieldValue(input: { projectId: $p, itemId: $i, fieldId: $f, value: $v }) { projectV2Item { id } }
+          }`,
+          { p: P.projectId, i: item.itemId, f: f.id, v: value },
+        );
+      }
     } catch (e) {
       console.log(`${label(item)}: ${fieldName} skipped (${e.message})`);
       return false;
     }
   }
   item.values[fieldName] = { value: raw, updatedAt: new Date().toISOString() };
-  console.log(`${label(item)}: ${fieldName} -> ${f.dataType === 'TEXT' ? '(text)' : raw}`);
+  console.log(`${label(item)}: ${fieldName} -> ${f?.dataType === 'TEXT' ? '(text)' : raw}`);
   changes++;
   return true;
 }
