@@ -232,3 +232,23 @@ export async function sendWhatsApp(text) {
   console.log(`WhatsApp sent: HTTP ${res.status}`); // never log the message itself
   return res.ok;
 }
+
+// ---------- Org "issue fields" (e.g. Start date, Target date) ----------
+// These live on the issue itself, not the board, so they need the REST API.
+export async function loadIssueFields() {
+  const res = await fetch(`https://api.github.com/orgs/${ORG}/issue-fields`, { headers: restHeaders });
+  if (!res.ok) {
+    console.log(`Issue fields not available (HTTP ${res.status})`);
+    return {};
+  }
+  const list = await res.json();
+  return Object.fromEntries(list.map((f) => [f.name.toLowerCase(), { id: f.id, name: f.name }]));
+}
+export async function setIssueFieldValue(repo, number, fieldId, value) {
+  const res = await fetch(`https://api.github.com/repos/${ORG}/${repo}/issues/${number}/issue-field-values`, {
+    method: 'POST',
+    headers: restHeaders,
+    body: JSON.stringify({ issue_field_values: [{ field_id: fieldId, value: String(value) }] }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+}
