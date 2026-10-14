@@ -1,0 +1,9 @@
+# Local secrets: never commit
+.env
+.env.*
+!.env.example
+
+# Dependencies / OS noise
+node_modules/
+Thumbs.db
+.DS_Store

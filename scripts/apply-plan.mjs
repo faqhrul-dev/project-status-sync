@@ -4,8 +4,11 @@
 // Preview (changes nothing):   node scripts/apply-plan.mjs
 // Write to GitHub:             node scripts/apply-plan.mjs --apply
 //
+// Token: put GH_TOKEN in the repo's .env file (see .env.example), or set it in the shell.
 // Needs GH_TOKEN with: repo (issues) + project (org Projects) scopes.
 // Safe to re-run: new issues are matched by exact title and not created twice.
+
+import './env.mjs';
 
 const ORG = 'onlineoms';
 const REPO = 'devinfra';
@@ -16,7 +19,7 @@ const MODULE = 'Accounts';
 const APPLY = process.argv.includes('--apply');
 const TOKEN = process.env.GH_TOKEN;
 if (!TOKEN) {
-  console.error('GH_TOKEN is not set. In PowerShell: $env:GH_TOKEN = "<your token>"');
+  console.error('GH_TOKEN is not set. Add it to .env in the project-status-sync folder (see .env.example).');
   process.exit(1);
 }
 
